@@ -401,37 +401,54 @@ func (r *SecretProviderClassPodStatusReconciler) processIfBelongsToNode(objMeta 
 // createOrUpdateK8sSecret creates K8s secret with data from mounted files
 // If a secret with the same name already exists in the namespace of the pod, it will update that existing secret.
 func (r *SecretProviderClassPodStatusReconciler) createOrUpdateK8sSecret(ctx context.Context, name, namespace string, datamap map[string][]byte, labelsmap map[string]string, annotationsmap map[string]string, secretType corev1.SecretType) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      labelsmap,
-			Annotations: annotationsmap,
-		},
-		Type: secretType,
-		Data: datamap,
+	secret := &corev1.Secret{}
+	getErr := r.reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret)
+
+	// Secret exists, update it
+	if getErr == nil {
+		klog.V(5).InfoS("Kubernetes secret is already created", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+
+		if secretIsUnchanged(secret, datamap, annotationsmap, labelsmap, secretType) {
+			return nil
+		}
+
+		secret.Labels = labelsmap
+		secret.Annotations = annotationsmap
+		secret.Data = datamap
+		secret.Type = secretType
+
+		if err := r.writer.Update(ctx, secret); err != nil {
+			return err
+		}
+
+		klog.V(5).InfoS("successfully updated Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+		return nil
 	}
 
-	err := r.writer.Create(ctx, secret)
-	if err == nil {
+	// Secret does not exist, create it
+	if apierrors.IsNotFound(getErr) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      labelsmap,
+				Annotations: annotationsmap,
+			},
+			Type: secretType,
+			Data: datamap,
+		}
+
+		err := r.writer.Create(ctx, secret)
+		if err != nil {
+			return err
+		}
+
 		klog.InfoS("successfully created Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
 		return nil
 	}
-	if !apierrors.IsAlreadyExists(err) {
-		return err
-	}
 
-	if secretIsUnchanged(secret, datamap, annotationsmap, labelsmap, secretType) {
-		return nil
-	}
-
-	klog.V(5).InfoS("Kubernetes secret is already created", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
-	err = r.writer.Update(ctx, secret)
-	if err != nil {
-		return err
-	}
-	klog.V(5).InfoS("successfully updated Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
-	return nil
+	// Get call returned error other than "not found"
+	return getErr
 }
 
 func secretIsUnchanged(secret *corev1.Secret, datamap map[string][]byte, annotationsmap map[string]string, labelsmap map[string]string, secretType corev1.SecretType) bool {
