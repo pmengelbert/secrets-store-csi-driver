@@ -17,8 +17,10 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -419,6 +421,10 @@ func (r *SecretProviderClassPodStatusReconciler) createOrUpdateK8sSecret(ctx con
 		return err
 	}
 
+	if secretIsUnchanged(secret, datamap, annotationsmap, labelsmap, secretType) {
+		return nil
+	}
+
 	klog.V(5).InfoS("Kubernetes secret is already created", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
 	err = r.writer.Update(ctx, secret)
 	if err != nil {
@@ -426,6 +432,15 @@ func (r *SecretProviderClassPodStatusReconciler) createOrUpdateK8sSecret(ctx con
 	}
 	klog.V(5).InfoS("successfully updated Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
 	return nil
+}
+
+func secretIsUnchanged(secret *corev1.Secret, datamap map[string][]byte, annotationsmap map[string]string, labelsmap map[string]string, secretType corev1.SecretType) bool {
+	return secret.Type == secretType &&
+		maps.Equal(secret.Annotations, annotationsmap) &&
+		maps.Equal(secret.Labels, labelsmap) &&
+		maps.EqualFunc(datamap, secret.Data, func(b, c []byte) bool {
+			return bytes.Equal(b, c)
+		})
 }
 
 // patchSecretWithOwnerRef patches the secret owner reference with the spc pod status
