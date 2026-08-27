@@ -17,10 +17,8 @@ limitations under the License.
 package controllers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +30,7 @@ import (
 	"sigs.k8s.io/secrets-store-csi-driver/pkg/util/secretutil"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
@@ -404,27 +403,6 @@ func (r *SecretProviderClassPodStatusReconciler) createOrUpdateK8sSecret(ctx con
 	secret := &corev1.Secret{}
 	getErr := r.reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret)
 
-	// Secret exists, update it
-	if getErr == nil {
-		klog.V(5).InfoS("Kubernetes secret is already created", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
-
-		if secretIsUnchanged(secret, datamap, annotationsmap, labelsmap, secretType) {
-			return nil
-		}
-
-		secret.Labels = labelsmap
-		secret.Annotations = annotationsmap
-		secret.Data = datamap
-		secret.Type = secretType
-
-		if err := r.writer.Update(ctx, secret); err != nil {
-			return err
-		}
-
-		klog.V(5).InfoS("successfully updated Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
-		return nil
-	}
-
 	// Secret does not exist, create it
 	if apierrors.IsNotFound(getErr) {
 		secret := &corev1.Secret{
@@ -439,25 +417,53 @@ func (r *SecretProviderClassPodStatusReconciler) createOrUpdateK8sSecret(ctx con
 		}
 
 		err := r.writer.Create(ctx, secret)
-		if err != nil {
-			return err
+		if apierrors.IsAlreadyExists(err) {
+			return nil
 		}
 
-		klog.InfoS("successfully created Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+		if err == nil {
+			klog.InfoS("successfully created Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+		}
+
+		return err
+	}
+
+	if getErr != nil {
+		return getErr
+	}
+
+	// Secret exists, update it
+	klog.V(5).InfoS("Kubernetes secret is already created", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+
+	// The return from a controller-runtime `Get` operation does not guarantee
+	// ownership (for example, it could be a memory reference to a cache entry),
+	// so have to be copied before they can be modified.
+	orig := secret.DeepCopy()
+	secret = secret.DeepCopy()
+
+	// check whether or not if secret is changed or not
+	secret.Labels = labelsmap
+	secret.Annotations = annotationsmap
+	secret.Data = datamap
+	secret.Type = secretType
+
+	if equality.Semantic.DeepEqual(orig, secret) {
 		return nil
 	}
 
-	// Get call returned error other than "not found"
-	return getErr
-}
+	if err := r.writer.Update(ctx, secret); err != nil {
+		// If the object has been updated by another caller, we do not know the
+		// proper authority. In that case, the update request shouldn't be
+		// re-queued.
+		if apierrors.IsConflict(err) {
+			return nil
+		}
 
-func secretIsUnchanged(secret *corev1.Secret, datamap map[string][]byte, annotationsmap map[string]string, labelsmap map[string]string, secretType corev1.SecretType) bool {
-	return secret.Type == secretType &&
-		maps.Equal(secret.Annotations, annotationsmap) &&
-		maps.Equal(secret.Labels, labelsmap) &&
-		maps.EqualFunc(datamap, secret.Data, func(b, c []byte) bool {
-			return bytes.Equal(b, c)
-		})
+		return err
+	}
+
+	klog.V(5).InfoS("successfully updated Kubernetes secret", "secret", klog.ObjectRef{Namespace: namespace, Name: name})
+	return nil
 }
 
 // patchSecretWithOwnerRef patches the secret owner reference with the spc pod status
